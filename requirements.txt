@@ -1,0 +1,11 @@
+fastapi==0.114.2
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+starlette==0.38.5
+faster-whisper==1.0.2
+ctranslate2==4.3.1
+TTS==0.22.0
+numpy==1.22.0
+soundfile==0.12.1
+ffmpeg-python==0.2.0

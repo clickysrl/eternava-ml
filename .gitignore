@@ -1,0 +1,15 @@
+node_modules/
+pretrained_models/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+.env
+.env.*
+
+certs/
+*.pem
+*.key
+
+logs/
