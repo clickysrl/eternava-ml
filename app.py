@@ -24,6 +24,19 @@ from voicecheck import (
 )
 import yt_dlp
 import shutil
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+
+# --- CONFIGURAZIONE ---
+# URL del server Node (cambia con l'indirizzo reale in produzione)
+NODE_API_URL = os.getenv("NODE_API_URL", "https://api.eternava.it/api")
+
+# Cartelle
+XTTS_STORE_DIR = os.getenv("XTTS_SPEAKER_DIR", "/data/xtts_speakers")
+PUBLIC_AUDIO_DIR = "/data/public_audio" # Cartella pubblica per i file audio
+
+os.makedirs(XTTS_STORE_DIR, exist_ok=True)
+os.makedirs(PUBLIC_AUDIO_DIR, exist_ok=True)
 _ABBR_IT = {
     "sig", "sigg", "sigra", "sig.na", "sig.ra", "dott", "dr", "ing", "prof", "avv", "ecc",
     "cap", "gen", "comm", "rag", "arch"
@@ -622,6 +635,8 @@ def download_audio_resource(url: str, dest_path: str):
     with open(dest_path, "wb") as out:
         for chunk in r.iter_content(1024*1024):
             if chunk: out.write(chunk)
+
+app.mount("/static/audio", StaticFiles(directory=PUBLIC_AUDIO_DIR), name="audio")
 # =========================
 # ======== XTTS API =======
 # =========================
