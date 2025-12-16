@@ -1150,22 +1150,23 @@ async def voicecheck(
 # =========================
 # ====== WEBSOCKET ========
 # =========================
-
 @app.websocket("/v1/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     # 1. HANDSHAKE INIZIALE
+    # Il client invia un JSON con { token, user_id, language, speaker_id }
     try:
         init_data = await websocket.receive_json()
         token = init_data.get("token")
-        # TODO: Qui potresti validare il token chiamando Node se vuoi sicurezza massima
+        # TODO: Validazione token opzionale qui (chiamata a Node auth/me)
         
         user_id = init_data.get("user_id", "anon")
         lang = init_data.get("language", "it")
         
-        # Se l'app non manda uno speaker specifico, l'ID speaker è l'ID utente
-        # Questo attiva la modalità "Imparo da te"
+        # MODALITÀ "IMPARO DA TE":
+        # Se l'app non manda uno speaker_id (o manda null), usiamo l'user_id.
+        # Questo significa che l'AI userà la voce dell'utente stesso (clonazione istantanea).
         speaker_id = init_data.get("speaker_id") or user_id 
         
         print(f"[WS] Connesso User: {user_id} | Speaker Target: {speaker_id}")
@@ -1175,70 +1176,90 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Inizializza sessione chat (memoria contesto LLM)
+    # Inizializza sessione chat (memoria contesto per ChatGPT)
     _, session = _get_chat_session(user_id, lang)
     audio_buffer = bytearray()
     
-    # Genera un ID gruppo per questo scambio
+    # Genera un ID gruppo univoco per questo scambio (Domanda + Risposta)
     current_group_id = str(uuid.uuid4())
 
     try:
         while True:
-            # Ricezione Messaggi dal Client
+            # Ricezione Messaggi dal Client (App Angular)
             message = await websocket.receive()
 
+            # --- A. STREAMING AUDIO IN INGRESSO ---
             if "bytes" in message:
-                # Streaming audio in ingresso
                 audio_buffer.extend(message["bytes"])
                 
+            # --- B. COMANDI TESTUALI ---
             elif "text" in message:
                 text_msg = message["text"]
                 
-                # COMANDO: L'UTENTE HA FINITO DI PARLARE
+                # Variabile per contenere il testo dell'utente (trascritto o digitato)
+                final_user_text = ""
+                
+                # CASO 1: L'UTENTE HA FINITO DI PARLARE ("END_SPEECH")
                 if text_msg == "END_SPEECH":
                     if len(audio_buffer) == 0: continue
-                        
+                    
                     await websocket.send_json({"status": "processing", "step": "transcribing"})
                     
-                    # --- A. SALVATAGGIO INPUT UTENTE ---
-                    # Salviamo l'audio in una cartella pubblica per poterlo riprodurre dopo
+                    # 1. Salva Audio Utente (Pubblico)
                     user_filename = f"u_{user_id}_{uuid.uuid4().hex[:10]}.wav"
                     user_wav_path = os.path.join(PUBLIC_AUDIO_DIR, user_filename)
-                    
                     with open(user_wav_path, "wb") as f:
                         f.write(audio_buffer)
                     
-                    # --- B. ADDESTRAMENTO ISTANTANEO (Zero-Shot) ---
-                    # Copiamo questo audio nella cartella "profilo vocale" dello speaker
-                    # Così XTTS lo userà subito come riferimento per clonare il tono
+                    # 2. ADDESTRAMENTO ISTANTANEO (Zero-Shot)
+                    # Copia l'audio appena ricevuto nella cartella di addestramento dello speaker.
+                    # XTTS userà questo file IMMEDIATAMENTE per clonare meglio la voce.
                     spk_dir = os.path.join(XTTS_STORE_DIR, speaker_id)
                     os.makedirs(spk_dir, exist_ok=True)
-                    # Lo salviamo come reference per il futuro
-                    train_ref_path = os.path.join(spk_dir, f"ref_{int(__import__('time').time())}.wav")
+                    train_ref_path = os.path.join(spk_dir, f"ref_{int(time.time())}.wav")
                     shutil.copy(user_wav_path, train_ref_path)
                     
-                    # --- C. TRASCRIZIONE (ASR) ---
-                    # Usiamo float16 per velocità sulla GPU
+                    # 3. Trascrizione (ASR Whisper)
+                    # Usa float16 se sei su GPU per massima velocità
                     model = get_model(DEFAULT_CTYPE) 
                     segments, _ = model.transcribe(user_wav_path, language=lang, beam_size=2)
-                    user_text = " ".join([s.text for s in segments]).strip()
+                    final_user_text = " ".join([s.text for s in segments]).strip()
                     
-                    if not user_text:
+                    if not final_user_text:
                         await websocket.send_json({"status": "error", "msg": "Non ho sentito nulla"})
-                        audio_buffer = bytearray() # Reset buffer
+                        audio_buffer = bytearray()
                         continue
 
-                    # Invia testo capito all'app
+                    # Notifica all'app il testo capito
                     await websocket.send_json({
                         "status": "transcription", 
-                        "text": user_text, 
+                        "text": final_user_text, 
                         "groupId": current_group_id
                     })
                     
-                    # --- D. GENERAZIONE RISPOSTA (LLM - ChatGPT) ---
-                    # Istruiamo l'LLM a copiare lo stile
+                    # Reset buffer audio per il prossimo turno
+                    audio_buffer = bytearray()
+
+                # CASO 2: INPUT TESTUALE DIRETTO ("TEXT_INPUT:...")
+                elif text_msg.startswith("TEXT_INPUT:"):
+                    final_user_text = text_msg.replace("TEXT_INPUT:", "").strip()
+                    if not final_user_text: continue
+                    
+                    # Feedback immediato
+                    await websocket.send_json({
+                        "status": "transcription", 
+                        "text": final_user_text, 
+                        "groupId": current_group_id
+                    })
+                    # (Qui non c'è audio utente da salvare o addestrare)
+
+                # --- SE ABBIAMO UN TESTO UTENTE, PROCEDIAMO CON LA RISPOSTA AI ---
+                if final_user_text:
+                    
+                    # 4. Generazione Risposta (LLM ChatGPT)
+                    # Istruzione per imitare lo stile
                     style_instruction = (
-                        f"L'utente ha detto: '{user_text}'. "
+                        f"L'utente ha detto: '{final_user_text}'. "
                         "Rispondi brevemente. Imita il tono e lo stile dell'utente (es. se è formale sii formale, se scherza scherza)."
                     )
                     reply_text = _call_openai_chat(prompt=style_instruction, user_id=user_id, lang=lang)
@@ -1249,81 +1270,90 @@ async def websocket_endpoint(websocket: WebSocket):
                         "groupId": current_group_id
                     })
                     
-                    # --- E. GENERAZIONE AUDIO (TTS) ---
+                    # 5. Generazione Audio (TTS XTTS)
                     await websocket.send_json({"status": "processing", "step": "generating_audio"})
                     
-                    # Recupera TUTTI i file audio dell'utente come riferimento
-                    # Più parli, più file ci sono, più la clonazione è precisa
+                    # Recupera i file di riferimento (incluso quello appena salvato se era vocale!)
                     ref_wavs = _list_speaker_refs(speaker_id)
-                    if not ref_wavs: ref_wavs = [user_wav_path] # Fallback minimo
-
+                    # Fallback se non ci sono ref (es. primo messaggio testuale su nuovo speaker)
+                    if not ref_wavs and 'user_wav_path' in locals(): ref_wavs = [user_wav_path]
+                    
                     tts = get_tts()
+                    # Splitta in frasi per streaming fluido
                     sentences = _split_tts_text(reply_text, max_chars=200)
                     
-                    full_ai_audio = [] # Buffer per salvare l'audio AI completo
+                    full_ai_audio = [] # Accumulatore per il file finale
                     
                     for sent in sentences:
                         if not sent.strip(): continue
                         
-                        # Genera audio
-                        out_wav = tts.tts(
-                            text=sent, 
-                            language=lang,
-                            speaker_wav=ref_wavs, # <--- QUI avviene la clonazione dinamica
-                            split_sentences=False
-                        )
-                        
-                        # Processa array per streaming
-                        wav_np = np.array(out_wav, dtype=np.float32)
-                        full_ai_audio.extend(wav_np)
-                        
-                        # Normalizza e invia bytes all'App
-                        wav_np_norm = wav_np / (np.max(np.abs(wav_np)) + 1e-9)
-                        wav_int16 = (wav_np_norm * 32767).astype(np.int16)
-                        await websocket.send_bytes(wav_int16.tobytes())
+                        try:
+                            # Genera audio clonando la voce dai ref_wavs
+                            out_wav = tts.tts(
+                                text=sent, 
+                                language=lang,
+                                speaker_wav=ref_wavs, # <--- CLONAZIONE DINAMICA
+                                split_sentences=False
+                            )
+                            
+                            # Conversione Float32 -> Int16 per streaming
+                            wav_np = np.array(out_wav, dtype=np.float32)
+                            full_ai_audio.extend(wav_np)
+                            
+                            wav_np_norm = wav_np / (np.max(np.abs(wav_np)) + 1e-9)
+                            wav_int16 = (wav_np_norm * 32767).astype(np.int16)
+                            
+                            # Invia chunk audio al client
+                            await websocket.send_bytes(wav_int16.tobytes())
+                        except Exception as tts_err:
+                            print(f"[WS] TTS Error on chunk: {tts_err}")
+
+                    # 6. Salvataggio e Sync (Node.js)
                     
-                    # --- F. SALVATAGGIO & SYNC CON NODE ---
-                    # Salva audio AI su disco pubblico
+                    # Salva file AI completo su disco pubblico
                     ai_filename = f"ai_{user_id}_{uuid.uuid4().hex[:10]}.wav"
                     ai_wav_path = os.path.join(PUBLIC_AUDIO_DIR, ai_filename)
+                    # XTTS_SR è definito in app.py (di solito 24000)
                     sf.write(ai_wav_path, full_ai_audio, XTTS_SR)
                     
-                    # Costruisci URL pubblici (sostituisci con il tuo dominio pubblico)
-                    # Es: https://ml.nexipse.it/static/audio/...
+                    # Costruisci URL
+                    # Sostituisci con il tuo dominio pubblico reale in produzione
                     base_url = "https://ml.nexipse.it/static/audio" 
                     
                     # Prepara payload per Node
                     payload = {
                         "userId": user_id,
                         "groupId": current_group_id,
-                        "userText": user_text,
-                        "userAudioUrl": f"{base_url}/{user_filename}",
+                        "userText": final_user_text,
+                        # Se l'input era testo, non c'è userAudioUrl
+                        "userAudioUrl": f"{base_url}/{user_filename}" if 'user_filename' in locals() else None,
                         "aiText": reply_text,
                         "aiAudioUrl": f"{base_url}/{ai_filename}",
-                        "speakerId": speaker_id
+                        "speakerId": speaker_id,
+                        "voiceId": speaker_id # Per compatibilità col modello
                     }
                     
-                    # Chiama Node in background (Fire & Forget)
+                    # Chiamata Sync a Node (Fire & Forget con timeout breve)
                     try:
                         print(f"[WS] Syncing to Node: {NODE_API_URL}/internal/save-chat")
                         requests.post(f"{NODE_API_URL}/internal/save-chat", json=payload, timeout=5)
                     except Exception as err:
                         print(f"[WS] ERRORE SYNC NODE: {err}")
 
-                    # Segnala fine turno
+                    # 7. Fine Turno
                     await websocket.send_json({"status": "done", "groupId": current_group_id})
                     
-                    # Reset variabili per il prossimo messaggio
-                    audio_buffer = bytearray()
+                    # Reset variabili loop
                     current_group_id = str(uuid.uuid4())
+                    if 'user_filename' in locals(): del user_filename
+                    if 'user_wav_path' in locals(): del user_wav_path
 
     except WebSocketDisconnect:
         print(f"[WS] Disconnected: {user_id}")
     except Exception as e:
         print(f"[WS] Error: {e}")
         try: await websocket.close()
-        except: pass
-# =========================
+        except: pass# =========================
 # ======== ASR API ========
 # =========================
 
