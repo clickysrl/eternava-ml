@@ -1230,11 +1230,27 @@ async def websocket_endpoint(websocket: WebSocket):
                     # NOTIFICA APP: "STO ELABORANDO..."
                     await websocket.send_json({"status": "processing", "step": "transcribing"})
                     
-                    # --- A. SALVATAGGIO AUDIO ---
+                    # --- A. SALVATAGGIO AUDIO (RAW WEBM) + CONVERSIONE WAV ---
+                    raw_filename = f"u_{user_id}_{uuid.uuid4().hex[:10]}.webm"
+                    raw_path = os.path.join(PUBLIC_AUDIO_DIR, raw_filename)
+                    with open(raw_path, "wb") as f:
+                        f.write(audio_buffer)
+
                     user_filename = f"u_{user_id}_{uuid.uuid4().hex[:10]}.wav"
                     user_wav_path = os.path.join(PUBLIC_AUDIO_DIR, user_filename)
-                    with open(user_wav_path, "wb") as f:
-                        f.write(audio_buffer)
+
+                    subprocess.run([
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-i", raw_path,
+                        "-ar", "24000", "-ac", "1",
+                        "-c:a", "pcm_s16le",
+                        user_wav_path
+                    ], check=True)
+
+                    try:
+                        os.remove(raw_path)
+                    except:
+                        pass
                     
                     # --- B. ADDESTRAMENTO ISTANTANEO ---
                     spk_dir = os.path.join(XTTS_STORE_DIR, speaker_id)
